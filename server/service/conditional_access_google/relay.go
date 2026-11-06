@@ -15,7 +15,11 @@ import (
 	"github.com/fleetdm/fleet/v4/pkg/str"
 )
 
-const registrationPath = "/api/v1/google-conditional-access"
+const (
+	registrationPath  = "/api/v1/google-conditional-access"
+	signInPath        = registrationPath + "/sign-in"
+	androidDevicePath = registrationPath + "/android-device"
+)
 
 const maxRelayResponseBytes = 1 << 20
 
@@ -81,7 +85,7 @@ type Registration struct {
 func (r *relay) Register(ctx context.Context, serverURL, customerID string) (*Registration, error) {
 	var resp Registration
 	// Errors carry only fleetdm.com's answer: the caller names the operation.
-	if err := r.send(ctx, http.MethodPost, serverURL, registerRequest{CustomerID: customerID}, &resp); err != nil {
+	if err := r.send(ctx, http.MethodPost, registrationPath, serverURL, registerRequest{CustomerID: customerID}, &resp); err != nil {
 		return nil, err
 	}
 	if resp.FleetServerSecret == "" {
@@ -96,16 +100,68 @@ type deregisterRequest struct {
 }
 
 func (r *relay) Deregister(ctx context.Context, serverURL, customerID, secret string) error {
-	err := r.send(ctx, http.MethodDelete, serverURL, deregisterRequest{CustomerID: customerID, Secret: secret}, nil)
+	return asRelayNotFound(r.send(ctx, http.MethodDelete, registrationPath, serverURL, deregisterRequest{CustomerID: customerID, Secret: secret}, nil))
+}
+
+func asRelayNotFound(err error) error {
 	if se, ok := errors.AsType[*RelayStatusError](err); ok && se.Code == http.StatusNotFound {
-		err = &relayNotFoundError{RelayStatusError: se}
+		return &relayNotFoundError{RelayStatusError: se}
 	}
 	return err
 }
 
+func (r *relay) SignInURL(customerID, hostUUID, token string) (string, error) {
+	if r.uriErr != nil {
+		return "", r.uriErr
+	}
+	q := url.Values{}
+	q.Set("googleCustomerId", customerID)
+	q.Set("hostUuid", hostUUID)
+	q.Set("token", token)
+	return r.uri + signInPath + "?" + q.Encode(), nil
+}
+
+// AndroidDeviceRegistration is what the Fleet Android app sends to sign the host in.
+type AndroidDeviceRegistration struct {
+	ServerAuthCode string
+	HostUUID       string
+	// AndroidID is the Google Services Framework ID, empty when the app couldn't read it.
+	AndroidID string
+}
+
+type androidDeviceRequest struct {
+	CustomerID     string `json:"googleCustomerId"`
+	Secret         string `json:"fleetServerSecret"`
+	ServerAuthCode string `json:"serverAuthCode"`
+	HostUUID       string `json:"hostUuid"`
+	AndroidID      string `json:"androidId,omitempty"`
+}
+
+// DeviceLookup is the signed-in user and the DeviceUsers Google's lookup returned.
+type DeviceLookup struct {
+	// Names is empty when Google has no matching record, and when no Android ID was sent.
+	Names    []string `json:"names"`
+	Customer string   `json:"customer"`
+	Email    string   `json:"email"`
+}
+
+func (r *relay) RegisterAndroidDevice(ctx context.Context, serverURL, customerID, secret string, reg AndroidDeviceRegistration) (*DeviceLookup, error) {
+	var resp DeviceLookup
+	if err := r.send(ctx, http.MethodPost, androidDevicePath, serverURL, androidDeviceRequest{
+		CustomerID:     customerID,
+		Secret:         secret,
+		ServerAuthCode: reg.ServerAuthCode,
+		HostUUID:       reg.HostUUID,
+		AndroidID:      reg.AndroidID,
+	}, &resp); err != nil {
+		return nil, asRelayNotFound(err)
+	}
+	return &resp, nil
+}
+
 // send decodes a 2xx response into response, which may be nil. Other statuses return a
 // *RelayStatusError.
-func (r *relay) send(ctx context.Context, method, serverURL string, body, response any) error {
+func (r *relay) send(ctx context.Context, method, path, serverURL string, body, response any) error {
 	if r.uriErr != nil {
 		return r.uriErr
 	}
@@ -113,7 +169,7 @@ func (r *relay) send(ctx context.Context, method, serverURL string, body, respon
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, r.uri+registrationPath, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, method, r.uri+path, bytes.NewReader(b))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -173,7 +229,8 @@ func (e *RelayStatusError) StatusCode() int { return e.Code }
 
 func (e *RelayStatusError) Body() string { return e.RespErr }
 
-// relayNotFoundError is a 404 on Deregister: no matching registration.
+// relayNotFoundError is a 404 on a call carrying the secret: no registration matches the
+// customer ID and secret.
 type relayNotFoundError struct {
 	*RelayStatusError
 }

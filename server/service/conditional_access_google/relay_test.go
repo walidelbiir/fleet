@@ -197,3 +197,52 @@ func TestRelayRequiresHTTPS(t *testing.T) {
 	// Nothing listens there, so the send fails.
 	require.ErrorContains(t, p.Deregister(t.Context(), origin, "C02cajzvg", "s3cret"), "send request")
 }
+
+func TestSignInURL(t *testing.T) {
+	r := NewRelay("https://fleetdm.example.com/")
+	u, err := r.SignInURL("C02cajzvg", "host uuid/1", "tok+en")
+	require.NoError(t, err)
+	require.Equal(t, "https://fleetdm.example.com/api/v1/google-conditional-access/sign-in?googleCustomerId=C02cajzvg&hostUuid=host+uuid%2F1&token=tok%2Ben", u)
+
+	_, err = NewRelay("http://insecure.example.com").SignInURL("C02cajzvg", "h", "t")
+	require.Error(t, err)
+}
+
+func TestRegisterAndroidDevice(t *testing.T) {
+	p, requests := newTestRelay(t, http.StatusOK, `{"names":["devices/d/deviceUsers/u"],"customer":"C02cajzvg","email":"user@example.com"}`)
+
+	resp, err := p.RegisterAndroidDevice(t.Context(), origin, "C02cajzvg", "s3cret", AndroidDeviceRegistration{
+		ServerAuthCode: "code", HostUUID: "host-1", AndroidID: "abc123",
+	})
+	require.NoError(t, err)
+	require.Equal(t, &DeviceLookup{Names: []string{"devices/d/deviceUsers/u"}, Customer: "C02cajzvg", Email: "user@example.com"}, resp)
+	require.Equal(t, []recordedRequest{{
+		method: http.MethodPost,
+		path:   "/api/v1/google-conditional-access/android-device",
+		origin: origin,
+		body: map[string]string{
+			"googleCustomerId": "C02cajzvg", "fleetServerSecret": "s3cret",
+			"serverAuthCode": "code", "hostUuid": "host-1", "androidId": "abc123",
+		},
+	}}, *requests)
+
+	// Without the ID, the field is left out and only the email comes back.
+	p, requests = newTestRelay(t, http.StatusOK, `{"email":"user@example.com"}`)
+	resp, err = p.RegisterAndroidDevice(t.Context(), origin, "C02cajzvg", "s3cret", AndroidDeviceRegistration{
+		ServerAuthCode: "code", HostUUID: "host-1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, &DeviceLookup{Email: "user@example.com"}, resp)
+	require.NotContains(t, (*requests)[0].body, "androidId")
+
+	p, _ = newTestRelay(t, http.StatusNotFound, `{"error":"not found"}`)
+	_, err = p.RegisterAndroidDevice(t.Context(), origin, "C02cajzvg", "wrong", AndroidDeviceRegistration{ServerAuthCode: "code", HostUUID: "host-1"})
+	require.True(t, fleet.IsNotFound(err))
+
+	p, _ = newTestRelay(t, http.StatusUnprocessableEntity, `{"error":"invalid_grant"}`)
+	_, err = p.RegisterAndroidDevice(t.Context(), origin, "C02cajzvg", "s3cret", AndroidDeviceRegistration{ServerAuthCode: "code", HostUUID: "host-1"})
+	var se *RelayStatusError
+	require.ErrorAs(t, err, &se)
+	require.NotNil(t, se)
+	require.Equal(t, http.StatusUnprocessableEntity, se.Code)
+}

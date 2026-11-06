@@ -35,6 +35,14 @@ func (f *fakeGoogleCARelay) Deregister(_ context.Context, serverURL, customerID,
 	return nil
 }
 
+func (f *fakeGoogleCARelay) SignInURL(customerID, hostUUID, token string) (string, error) {
+	return "https://fleetdm.example.com/sign-in?" + customerID + hostUUID + token, nil
+}
+
+func (f *fakeGoogleCARelay) RegisterAndroidDevice(context.Context, string, string, string, conditional_access_google.AndroidDeviceRegistration) (*conditional_access_google.DeviceLookup, error) {
+	return nil, errors.New("unexpected android registration")
+}
+
 type fakeGoogleCACloudIdentity struct {
 	unmanaged     *[]string
 	delegationErr error
@@ -47,6 +55,14 @@ func (f fakeGoogleCACloudIdentity) SetClientState(_ context.Context, name string
 		*f.unmanaged = append(*f.unmanaged, name)
 	}
 	return nil
+}
+
+func (f fakeGoogleCACloudIdentity) ListDeviceUserNames(context.Context, string) ([]string, error) {
+	return nil, errors.New("unexpected device user listing")
+}
+
+func (f fakeGoogleCACloudIdentity) DeviceExists(context.Context, string) (bool, error) {
+	return false, errors.New("unexpected device check")
 }
 
 type googleCAAppConfigTest struct {
