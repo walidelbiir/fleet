@@ -572,23 +572,13 @@ type googleDeviceMock struct {
 	androidErr    error
 	managed       []string            // "name hostUUID" per successful SetManaged
 	markErrs      map[string]error    // by DeviceUser name
+	unmarkErrs    map[string]error    // by DeviceUser name
 	deviceUsers   map[string][]string // DeviceUser names by device ID
 	goneDevices   map[string]bool     // by device ID
+	leftDevices   map[string]bool     // by device ID, no longer in the customer's Workspace
+	googleCalls   int
 	listErr       error
 }
-
-// googleResourceError is Google's 404 on a device or DeviceUser it no longer has, or its
-// 403 on one that left the customer's Workspace.
-type googleResourceError struct{ status int }
-
-func (e googleResourceError) Error() string {
-	if e.status == http.StatusNotFound {
-		return "Requested entity was not found."
-	}
-	return "The caller does not have permission"
-}
-func (e googleResourceError) IsNotFound() bool { return e.status == http.StatusNotFound }
-func (googleResourceError) IsStale() bool      { return true }
 
 func (m *mockedGoogleConditionalAccessClient) SignInURL(customerID, hostUUID, token string) (string, error) {
 	return conditional_access_google.NewRelay("https://fleetdm.example.com").SignInURL(customerID, hostUUID, token)
@@ -610,6 +600,25 @@ func (m *mockedGoogleConditionalAccessClient) RegisterAndroidDevice(_ context.Co
 	}
 	return m.dev.androidLookup, nil
 }
+
+// googleResourceError is Google's 404 on a device or DeviceUser it no longer has, or its
+// 403 on one that left the customer's Workspace.
+type googleResourceError struct{ status int }
+
+func (e googleResourceError) Error() string {
+	if e.status == http.StatusNotFound {
+		return "Requested entity was not found."
+	}
+	return "The caller does not have permission"
+}
+func (e googleResourceError) IsNotFound() bool { return e.status == http.StatusNotFound }
+func (googleResourceError) IsStale() bool      { return true }
+
+// googleAuthError is Google refusing the delegated token.
+type googleAuthError struct{}
+
+func (googleAuthError) Error() string     { return "unauthorized_client: Client is unauthorized" }
+func (googleAuthError) IsAuthError() bool { return true }
 
 func (m *mockedGoogleConditionalAccessClient) Register(_ context.Context, serverURL, customerID string) (*conditional_access_google.Registration, error) {
 	m.mu.Lock()
@@ -660,7 +669,11 @@ func (c *mockedGoogleCloudIdentity) CheckDelegation(_ context.Context) error {
 func (c *mockedGoogleCloudIdentity) SetClientState(_ context.Context, name string, state fleet.GoogleConditionalAccessClientState) error {
 	c.m.mu.Lock()
 	defer c.m.mu.Unlock()
+	c.m.dev.googleCalls++
 	if state.Managed != nil && !*state.Managed {
+		if err := c.m.dev.unmarkErrs[name]; err != nil {
+			return err
+		}
 		c.m.unmanaged = append(c.m.unmanaged, name)
 		return nil
 	}
@@ -678,6 +691,7 @@ func (c *mockedGoogleCloudIdentity) SetClientState(_ context.Context, name strin
 func (c *mockedGoogleCloudIdentity) ListDeviceUserNames(_ context.Context, deviceID string) ([]string, error) {
 	c.m.mu.Lock()
 	defer c.m.mu.Unlock()
+	c.m.dev.googleCalls++
 	if c.m.dev.listErr != nil {
 		return nil, c.m.dev.listErr
 	}
@@ -687,8 +701,14 @@ func (c *mockedGoogleCloudIdentity) ListDeviceUserNames(_ context.Context, devic
 	return slices.Clone(c.m.dev.deviceUsers[deviceID]), nil
 }
 
-func (c *mockedGoogleCloudIdentity) DeviceExists(context.Context, string) (bool, error) {
-	return false, errors.New("unexpected device check")
+func (c *mockedGoogleCloudIdentity) DeviceExists(_ context.Context, deviceID string) (bool, error) {
+	c.m.mu.Lock()
+	defer c.m.mu.Unlock()
+	c.m.dev.googleCalls++
+	if c.m.dev.leftDevices[deviceID] {
+		return false, googleResourceError{status: http.StatusForbidden}
+	}
+	return !c.m.dev.goneDevices[deviceID], nil
 }
 
 // devCalls returns the device side's recorded calls.
